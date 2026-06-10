@@ -1,0 +1,54 @@
+# Podman Quadlet — Next.js app container.
+#
+# Location on the server (rootless):
+#   ~/.config/containers/systemd/myapp.container
+#
+# Generated systemd unit:
+#   myapp.service
+#
+# Built from the locally-tagged image localhost/myapp:latest produced
+# off-server (WSL workstation) and loaded onto the server via
+# `podman save | scp | podman load`. See REDEPLOY.md.
+
+[Unit]
+Description=myapp Next.js application
+Requires=myapp-pod-pod.service myapp-postgres.service
+After=myapp-pod-pod.service myapp-postgres.service
+
+[Container]
+Image=localhost/myapp:latest
+ContainerName=myapp
+Pod=myapp-pod.pod
+
+# All app config + secrets live here:
+#   DATABASE_URL, NEXTAUTH_URL, NEXTAUTH_SECRET, AUTH_TRUST_HOST,
+#   plus whatever else the project needs.
+# chmod 600 on the host file.
+EnvironmentFile=%h/deploy/myapp/.env
+
+# No host port publishing — Caddy reaches us via myapp:3000 on edge-net.
+
+# Health check — adjust to a real /api/health route once the project
+# has one. For now this assumes a public path that returns 200 OK once
+# Next.js is ready (e.g. /login on apps with an auth screen, or / on
+# fully-public apps). curl -f exits non-zero on HTTP 4xx/5xx, so no need
+# for shell pipes or || exit (which Quadlet's HealthCmd= directive
+# can't safely pass to podman — systemd's parser eats some of the
+# special characters).
+HealthCmd=curl -fsS http://localhost:3000/
+HealthInterval=15s
+HealthRetries=5
+HealthStartPeriod=90s
+HealthTimeout=10s
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=180s
+
+# Resource cap — applied via systemd cgroup. Bump if the app workload
+# legitimately exceeds this.
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

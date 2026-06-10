@@ -1,0 +1,46 @@
+# Podman Quadlet — database pod (Postgres only).
+#
+# Location on the server (rootless):
+#   ~/.config/containers/systemd/myapp-db-pod.pod
+#
+# Generated systemd unit:
+#   myapp-db-pod-pod.service
+#
+# Sits ONLY on myapp-data-net (internal network). Caddy and the public
+# internet cannot reach it; only the app pod (also on myapp-data-net) can.
+# This pod currently holds a single container (myapp-postgres). It is
+# still kept as its own pod so a second DB (e.g. Redis) can be slotted
+# in later without re-plumbing networks.
+
+[Unit]
+Description=myapp database pod (internal only)
+Requires=myapp-data-net-network.service
+After=myapp-data-net-network.service
+
+[Pod]
+PodName=myapp-db-pod
+Network=myapp-data-net
+
+# Keep the pod alive across container restarts. Default `stop` would
+# kill the pod whenever the DB happens to be stopped, stranding it for
+# the next start.
+#
+# `PodmanArgs=--exit-policy=continue` rather than `ExitPolicy=continue`
+# because some Quadlet versions don't recognize the dedicated directive
+# in [Pod]. PodmanArgs= forwards the literal flag to `podman pod create`.
+PodmanArgs=--exit-policy=continue
+
+# Aardvark-dns registers pods, not the containers inside them, so by
+# default only `myapp-db-pod` resolves on the network. Add an alias for
+# the actual database service so the connection string can name
+# `myapp-postgres:5432` directly.
+NetworkAlias=myapp-postgres
+
+[Service]
+# Auto-recover if a container restart drags the pod into a stopped
+# state via Quadlet's BindsTo=.
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

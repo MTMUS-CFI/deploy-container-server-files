@@ -1,0 +1,98 @@
+# Containerfile template — Node + npm, builds in WSL, runs on RHEL/Podman.
+#
+# This is the reusable counterpart to the doc-app Containerfile, adapted for
+# a project that:
+#   - was developed on Windows with npm (not bun)
+#   - uses Postgres only (no Mongo)
+#   - is built from a WSL host, not directly on the RHEL server
+#
+# Substitutions before first build:
+#   - Pick a Node version line below that matches the project's engines.node
+#   - Drop or adapt the build-time placeholder envs at the bottom of the
+#     build stage to match what the project's modules check at load time
+#   - If the project uses native modules (bcrypt, sharp, etc.) that need a
+#     compiler, uncomment the `apt-get install build-essential python3` line
+#
+# Build (from WSL, in the project root):
+#   podman build -t localhost/myapp:1.0 -t localhost/myapp:latest .
+#
+# Ship + load: see REDEPLOY.md.
+
+# -----------------------------------------------------------------------------
+# Build stage — install deps, generate Prisma client, build the app.
+# -----------------------------------------------------------------------------
+FROM docker.io/node:24-bookworm AS build
+WORKDIR /app
+USER root
+
+# Node base images ship with a CA bundle, so apt over HTTPS works out of the
+# box. We still rewrite sources to HTTPS in case the build environment
+# blocks plain HTTP:80 (corporate firewall, restricted network).
+RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
+     | xargs -r sed -i 's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g'
+
+# Uncomment only if the project has native modules requiring a compiler.
+# bcryptjs (pure JS) doesn't need this; bcrypt (native) does. sharp ships
+# prebuilt binaries for most platforms but can fall back to compile.
+# RUN apt-get update \
+#  && apt-get install -y --no-install-recommends build-essential python3 \
+#  && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+# Build-time placeholder envs. Some frameworks (e.g. Next.js's page-data
+# collection) import every route at build time, and any module-level
+# `process.env.X` check throws if X is unset — even though the real value
+# arrives at runtime via the Quadlet's EnvironmentFile.
+#
+# List here only the vars that fail the build if absent. The runtime stage
+# doesn't inherit these, so no secrets leak into the image.
+ENV DATABASE_URL=postgresql://buildtime-placeholder:placeholder@localhost:5432/build?schema=public \
+    NEXTAUTH_SECRET=buildtime-placeholder-not-used-at-runtime \
+    NEXTAUTH_URL=http://localhost:3000
+
+RUN npx prisma generate \
+ && npm run build
+
+
+# -----------------------------------------------------------------------------
+# Runtime stage — only the built artifacts + curl (for the healthcheck).
+# -----------------------------------------------------------------------------
+FROM docker.io/node:24-bookworm AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    PORT=3000
+USER root
+
+# curl is the only runtime-only OS dep (used by the container's HEALTHCHECK).
+# If the app needs anything else at runtime (e.g. fonts for PDF rendering),
+# add it here.
+RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
+     | xargs -r sed -i 's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g' \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Copy only what runtime needs. Adjust the list based on the project's
+# framework. Defaults assume Next.js (App Router, standard build output).
+COPY --from=build /app/.next ./.next
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/public ./public
+COPY --from=build /app/prisma ./prisma
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/package-lock.json ./package-lock.json
+COPY --from=build /app/next.config.* ./
+COPY --from=build /app/tsconfig.json ./tsconfig.json
+
+# Operational scripts (migrations, imports, etc.). Drop or adjust if the
+# project doesn't have a scripts/ folder.
+COPY --from=build /app/scripts ./scripts
+
+# .env is supplied at runtime via Quadlet `EnvironmentFile=` — never baked in.
+
+EXPOSE 3000
+
+CMD ["npm", "start"]

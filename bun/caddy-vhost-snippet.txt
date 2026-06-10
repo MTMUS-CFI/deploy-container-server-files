@@ -1,0 +1,85 @@
+# Caddy vhost snippet for myapp.
+#
+# Caddy is already deployed on the server as a shared edge proxy (set up
+# once with the first app). For each new app, add a block to the existing
+# `~/deploy/caddy/Caddyfile` — do NOT replace it.
+#
+# Two phases:
+#   1. Pre-DNS — reach the app by server IP over plain HTTP on a path
+#      prefix or a dedicated port handler.
+#   2. Post-DNS — replace the path/port block with a real hostname so
+#      Caddy auto-provisions a Let's Encrypt cert.
+#
+# After editing the Caddyfile on the server:
+#   podman exec caddy caddy validate --config /etc/caddy/Caddyfile
+#   podman exec caddy caddy reload   --config /etc/caddy/Caddyfile
+#
+# `validate` first — `reload` will refuse a broken config and the running
+# Caddy keeps serving the previous one.
+
+# -----------------------------------------------------------------------------
+# Phase 1 — share :80 with other apps via a hostname stub
+# -----------------------------------------------------------------------------
+# If another app already owns the bare `:80 { ... }` block, the cleanest
+# way to add a second app pre-DNS is to give it a placeholder hostname
+# accessed via Host header / /etc/hosts mapping. Otherwise carve out a
+# unique port on the host (e.g. :8080) and publish it from Caddy.
+#
+# Hostname stub variant (Host header from a tester's /etc/hosts):
+
+myapp.local {
+    encode zstd gzip
+
+    reverse_proxy myapp:3000 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        transport http {
+            read_timeout 5m
+            write_timeout 5m
+            dial_timeout 10s
+        }
+    }
+
+    handle /healthz { respond "ok" 200 }
+}
+
+# Dedicated-port variant — Caddy listens on :8080 of the host so testers
+# can hit http://<server-ip>:8080/ directly. Requires the firewall to
+# allow 8080 (firewalld add-port=8080/tcp).
+#
+# :8080 {
+#     encode zstd gzip
+#     reverse_proxy myapp:3000 { ... same header_up / transport block ... }
+# }
+
+
+# -----------------------------------------------------------------------------
+# Phase 2 — real hostname once DNS goes live
+# -----------------------------------------------------------------------------
+# Swap the phase-1 block for the hostname block. Caddy will request a
+# Let's Encrypt cert via HTTP-01 (port 80 must remain reachable from the
+# public internet). Also update the app's `.env`:
+#   NEXTAUTH_URL=https://myapp.example.com
+# and `systemctl --user restart myapp`.
+
+# myapp.example.com {
+#     encode zstd gzip
+#
+#     reverse_proxy myapp:3000 {
+#         header_up Host {host}
+#         header_up X-Real-IP {remote_host}
+#         header_up X-Forwarded-For {remote_host}
+#         header_up X-Forwarded-Proto {scheme}
+#
+#         transport http {
+#             read_timeout 5m
+#             write_timeout 5m
+#             dial_timeout 10s
+#         }
+#     }
+#
+#     handle /healthz { respond "ok" 200 }
+# }

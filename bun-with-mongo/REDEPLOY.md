@@ -1,0 +1,345 @@
+# Redeploy a New Version of myapp
+
+Quick-reference for shipping code changes once the app is already running.
+For first-time setup, see [`SETUP_CHECKLIST.md`](SETUP_CHECKLIST.md) and
+[`README.md`](README.md).
+
+Three locations referenced below:
+- **WSL** — your Linux build host on the Windows workstation
+- **Server** — the RHEL host (e.g. `user@10.x.x.x`), via SSH or Cockpit terminal
+- **NetApp** — ONTAP CLI (only relevant if storage tweaks are part of the change)
+
+> **Why WSL + bun?** The project was developed with bun on Windows/WSL,
+> but the server runs Linux containers built with Podman. WSL gives you a
+> real Linux build host so `podman build`, `podman save`, and `scp` work
+> the same way they would on a Linux laptop. The container itself uses
+> the bun runtime end-to-end — `bun install` at build, `bun start` at
+> runtime.
+
+## 1. Build the new image in WSL
+
+The server can't pull from public registries during build, so the image
+has to be built off-server and shipped as a tarball.
+
+```bash
+# Inside WSL, in the project root (the same directory that holds package.json)
+cd /mnt/c/Users/<you>/path/to/myapp
+# or if you've cloned into WSL's native filesystem (recommended — faster I/O):
+cd ~/projects/myapp
+
+podman build -t localhost/myapp:1.0 -t localhost/myapp:latest .
+```
+
+Bump `:1.0` to `:1.1`, `:2.0`, etc. when you want a versioned trail.
+Keep `:latest` aliased to the newest build — the Quadlet's `Image=`
+line references `:latest`.
+
+1–3 min on first build (bun's install is much faster than npm), ~30–90s
+for incremental builds with the layer cache warm.
+
+### WSL-specific gotchas
+
+- **Cloning the repo inside WSL's native filesystem (`~/projects/...`) is
+  faster than building from `/mnt/c/...`.** Cross-filesystem I/O between
+  WSL2 and the Windows host adds ~2–3x build time on `bun install`. Less
+  dramatic than the npm penalty but still noticeable. If you can only
+  edit on the Windows side, use a git remote or VS Code's "Open in WSL"
+  workflow to keep the working tree on the Linux side.
+- **Podman in WSL needs `podman machine init` only on Windows hosts that
+  don't have WSL2 yet — on a working WSL2 install, Podman runs natively
+  in the distro.** Install with `sudo apt install podman` (or your
+  distro's equivalent).
+- **First build pulls ~200–300 MB of bun base layers.** Subsequent builds
+  reuse the cache.
+
+### If `bun install --frozen-lockfile` fails inside the container
+
+Almost always one of two things:
+
+1. **bun major-version skew between dev and the base image.** Container
+   uses `oven/bun:1-debian`, which is the latest bun 1.x. If dev was on
+   bun 0.x, regenerate the lockfile in WSL:
+   ```bash
+   bun --version          # should report 1.x
+   rm -rf node_modules bun.lock bun.lockb
+   bun install            # regenerates bun.lock
+   git status             # commit the regenerated lockfile
+   ```
+2. **Lockfile last touched outside WSL** (e.g. someone ran
+   `bun install` from Git Bash on Windows). Same fix as above —
+   regenerate in WSL so the resulting lockfile matches what the
+   container will see.
+
+## 2. Save and ship
+
+```bash
+# Inside WSL
+rm -f ~/myapp-image.tar
+podman save -o ~/myapp-image.tar localhost/myapp:1.0
+scp ~/myapp-image.tar user@<server-ip>:~/
+```
+
+`rm -f` first — `podman save` errors with
+`docker-archive doesn't support modifying existing images` if the
+target file already exists.
+
+~500 MB–1 GB transfer for a bun-based Next.js app. Don't gzip — image
+layers are already deduped.
+
+If you want a versioned trail of build tarballs (handy for rollback),
+write each save to a dated filename instead:
+
+```bash
+podman save -o ~/myapp-image-$(date +%F-%H%M).tar localhost/myapp:1.0
+scp ~/myapp-image-*.tar user@<server-ip>:~/
+```
+
+## 3. Load on the server
+
+```bash
+# On the server
+podman load -i ~/myapp-image.tar
+podman tag localhost/myapp:1.0 localhost/myapp:latest
+podman images localhost/myapp   # both tags should show the new image ID
+rm ~/myapp-image.tar            # optional cleanup
+```
+
+## 4. Restart the app container
+
+```bash
+systemctl --user restart myapp
+sleep 10
+podman ps --filter name=myapp --format 'table {{.Names}}\t{{.Status}}'
+```
+
+Should report `Up X seconds (healthy)` within ~90s. The DB and pods
+keep running — only the app container picks up the new image.
+
+If `restart myapp` returns "dependency job failed" because the pod was
+stranded:
+
+```bash
+systemctl --user reset-failed
+systemctl --user start myapp-pod-pod
+sleep 3
+systemctl --user start myapp
+```
+
+## 5. Verify
+
+```bash
+# From WSL or your workstation
+curl -I http://<server-ip>/
+# Expect: HTTP/1.1 200 OK, Content-Type: text/html
+```
+
+Then load `http://<server-ip>/` in a browser and exercise whatever flow
+you changed.
+
+---
+
+## Conditional steps — only if your changes include them
+
+### A. Schema (Prisma) changes
+
+```bash
+# On the server, after step 4
+podman exec myapp bunx prisma migrate deploy
+```
+
+Idempotent — safe to run on every redeploy. If the migration alters
+existing data, take an ONTAP snapshot of `vol_myapp_postgres` first.
+
+Mongo has no migration concept analogous to Prisma — schema changes
+happen at the application layer. If your release ships a non-trivial
+collection-shape change (renames, denorm fanouts), take an ONTAP
+snapshot of `vol_myapp_mongo` first too:
+
+```ontap
+volume snapshot create -vserver <SVM> \
+  -volume vol_myapp_mongo -snapshot premigration_$(date +%F)
+```
+
+### B. New environment variables
+
+```bash
+# On the server
+$EDITOR ~/deploy/myapp/.env
+# or, if you changed mongo/postgres seed creds (FIRST RUN ONLY — see below):
+$EDITOR ~/deploy/myapp/mongo.env
+$EDITOR ~/deploy/myapp/postgres.env
+
+# After saving:
+systemctl --user restart myapp
+# If you changed mongo.env / postgres.env, also restart the affected DB:
+systemctl --user restart myapp-mongo   # or myapp-postgres
+```
+
+No image rebuild required for env-only changes — files are loaded by
+the Quadlets at container start.
+
+**Warning on DB env-file changes**: the values in `postgres.env` and
+`mongo.env` are seed-time only. Changing `POSTGRES_PASSWORD` or
+`MONGO_INITDB_ROOT_PASSWORD` after the data dir is populated does NOT
+rotate the existing user. To rotate:
+
+```bash
+# Postgres
+podman exec -it myapp-postgres psql -U "$POSTGRES_USER" \
+  -c "ALTER USER \"$POSTGRES_USER\" WITH PASSWORD 'new-pass';"
+
+# Mongo
+podman exec -it myapp-mongo mongosh \
+  -u "$MONGO_INITDB_ROOT_USERNAME" --authenticationDatabase admin \
+  --eval "db.changeUserPassword('$MONGO_INITDB_ROOT_USERNAME','new-pass')"
+```
+
+Then update the matching segment of `DATABASE_URL` / `MONGODB_URI` in
+`.env` and `systemctl --user restart myapp`.
+
+### C. Quadlet (`.container` / `.pod` / `.network`) changes
+
+Quadlet files are independent of the app image. After updating them on
+the server, copy any changed Quadlets to `~/.config/containers/systemd/`:
+
+```bash
+# On the server, after the new tarball is loaded
+cp ~/deploy/myapp/quadlets/<changed-file> ~/.config/containers/systemd/
+
+systemctl --user daemon-reload
+# Then restart whichever services the changed Quadlets generate:
+systemctl --user restart <relevant-services>
+```
+
+If you're not sure what changed, copy all six and reload — it's
+idempotent:
+
+```bash
+cp ~/deploy/myapp/quadlets/*.{network,pod,container} \
+   ~/.config/containers/systemd/
+systemctl --user daemon-reload
+```
+
+Don't `systemctl --user enable` Quadlet-generated units — they're
+transient (regenerated on each `daemon-reload`) and `[Install]` is
+honored automatically.
+
+### D. Caddyfile changes
+
+```bash
+# On the server
+$EDITOR ~/deploy/caddy/Caddyfile
+
+podman exec caddy caddy validate --config /etc/caddy/Caddyfile
+podman exec caddy caddy reload --config /etc/caddy/Caddyfile
+```
+
+`validate` first — `reload` will refuse a broken config and the running
+Caddy keeps serving the previous one.
+
+If you edit with `vim`/`nano` and the change doesn't take effect, you
+may have hit the bind-mount-of-single-file inode issue. Fix by:
+`systemctl --user restart caddy`.
+
+### E. New NetApp volume / mount
+
+Rare during a normal redeploy — only if you're adding a new database
+or storage location. See [`README.md`](README.md) §1–§2 for the full
+ONTAP + fstab + chown sequence.
+
+### F. Mongo-specific maintenance
+
+Mongo is part of the base stack in this bundle, but a few ops sit
+apart from "redeploy the app":
+
+- **Bumping the Mongo image tag** (e.g. `mongo:7.0` → `mongo:7.0.x`):
+  edit `~/.config/containers/systemd/myapp-mongo.container`,
+  `daemon-reload`, restart with `systemctl --user restart myapp-mongo`.
+  Major-version bumps (7 → 8) need a snapshot first.
+- **Backup**:
+  ```bash
+  podman exec myapp-mongo mongodump --archive --gzip > mongo-$(date +%F).archive.gz
+  ```
+  Pair with `pg_dump` on the Postgres side for a complete app backup —
+  the two DBs are usually consistent only at the application layer, so
+  take both within seconds of each other if state correlates.
+- **Restore**:
+  ```bash
+  podman exec -i myapp-mongo mongorestore --archive --gzip --drop < mongo-<file>.archive.gz
+  ```
+- **Rotating the Mongo root password** — see §B above. The env-file
+  change alone does NOT rotate; you must run `db.changeUserPassword`
+  in the shell as root.
+- **Removing Mongo entirely from a deployment** (if a future release
+  migrates everything off GridFS): stop and remove
+  `myapp-mongo.container`, strip the `NetworkAlias=myapp-mongo` line
+  from `myapp-db-pod.pod`, restart the db-pod, and remove the
+  `MONGODB_URI` line from `.env`. The NetApp volume
+  (`vol_myapp_mongo`) can be kept (for a future re-enable) or
+  decommissioned via ONTAP.
+
+Size backup retention for both DBs — each NetApp volume needs its own
+ONTAP snapshot policy, and the periodic `pg_dump` / `mongodump` schedule
+should match the recovery objective for that data class.
+
+---
+
+## Rollback
+
+If the new image breaks something, revert by re-tagging an older saved
+image:
+
+```bash
+# On the server
+podman images localhost/myapp
+# Find a previous tag, e.g. localhost/myapp:1.0 (the prior version)
+
+podman tag localhost/myapp:<previous-version> localhost/myapp:latest
+systemctl --user restart myapp
+```
+
+If older versioned tags weren't kept, `podman load` from a saved
+tarball if you have one. Otherwise the only recovery is to re-build
+from a known-good git commit (inside WSL).
+
+For database rollback (if the breakage was a bad migration or a bad
+collection write), restore the affected volume from an ONTAP snapshot:
+
+```ontap
+# Postgres
+volume snapshot restore -vserver <SVM> \
+  -volume vol_myapp_postgres -snapshot <snapshot-name>
+
+# Mongo
+volume snapshot restore -vserver <SVM> \
+  -volume vol_myapp_mongo -snapshot <snapshot-name>
+```
+
+Each restore unmounts the volume on the client; remount with
+`sudo umount /netapp/myapp_data/<db> && sudo mount -a`, then restart
+the affected DB (`systemctl --user restart myapp-postgres` or
+`myapp-mongo`).
+
+If only one DB's data is bad, restore only that volume — the two
+volumes are independent. If state across the two DBs needs to be
+consistent (rare for well-designed apps), restore both to snapshots
+taken close together.
+
+---
+
+## Common failure modes during redeploy
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Error: image localhost/myapp:latest not found` after restart | `podman tag :1.0 :latest` step skipped | Run the tag command from step 3 |
+| `restart myapp` errors with "dependency job failed" | Pod stranded in dead state — pod's exit-policy defaults to `stop`, which kills it when the container restarts | Recover: `reset-failed`, then start `myapp-pod-pod`, then `myapp`. Permanent: ensure `myapp-pod.pod` carries `PodmanArgs=--exit-policy=continue` |
+| `quadlet-generator: unsupported key 'ExitPolicy' in group 'Pod'` | Older Quadlet versions don't accept the dedicated `ExitPolicy=` directive | Use `PodmanArgs=--exit-policy=continue` instead — same effect, recognized everywhere |
+| New image starts but app hangs at / | Stale build of an older code version still tagged `:latest` | Verify image IDs match: `podman images localhost/myapp` |
+| 502 from Caddy after restart | App took longer than usual to bind 3000 | Wait 60–90s; if persistent, `podman logs --tail 100 myapp` |
+| App logs show env-var errors | `.env` line still has surrounding `""` quotes or unencoded `+`/`/` in DB password | Strip quotes; URL-encode `+` → `%2B`, `/` → `%2F` in DB URLs only |
+| `bun install` ran inside the container and failed at runtime | Network restriction — this should only happen at build time in WSL | Don't run `podman exec myapp bun install`; rebuild and ship instead |
+| `podman save` errors with "docker-archive doesn't support modifying existing images" | Previous tarball still at the output path | `rm -f ~/myapp-image.tar` then re-run, or use a dated filename |
+| `bun install` very slow inside WSL | Repo lives on the Windows filesystem (`/mnt/c/...`) — cross-FS I/O is the bottleneck | Clone to WSL's native FS (`~/projects/myapp`) |
+| `scp` from WSL prompts for password every time | No SSH key forwarded into WSL | Generate a WSL key with `ssh-keygen` and copy with `ssh-copy-id user@<server-ip>` |
+| Container exits immediately with `script not found "start"` | Project's `package.json` has no `start` script | Add `"start": "next start"` to scripts, OR change Containerfile `CMD` to `["bun", "run", "next", "start"]` |
+| `bunx prisma migrate deploy` errors with `bunx: command not found` | The base image inside Podman doesn't have bunx on PATH (very rare with `oven/bun:1-debian`, but possible with custom base) | Use `bun x prisma migrate deploy` instead — same thing, dash-separated |

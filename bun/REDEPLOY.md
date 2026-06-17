@@ -213,6 +213,37 @@ Rare during a normal redeploy — only if you're adding a new database
 or storage location. See [`README.md`](README.md) §1–§2 for the full
 ONTAP + fstab + chown sequence.
 
+### F. Add-on (`mongo-addon/`, etc.) changes
+
+Addons follow the same patterns as A–E, just in the addon's namespace:
+
+- **Adding an addon to a running deployment** is a first-time integration,
+  not a redeploy — follow the addon's own README (which slots into the
+  base bundle's `README.md` §1–§7).
+- **Updating an addon Quadlet** (e.g. bumping the Mongo image tag,
+  changing `MemoryMax`): same flow as §C above. Copy the changed
+  `<addon>/*.container` into `~/.config/containers/systemd/`,
+  `daemon-reload`, and restart that addon's service:
+  ```bash
+  cp <repo>/mongo-addon/myapp-mongo.container ~/.config/containers/systemd/
+  systemctl --user daemon-reload
+  systemctl --user restart myapp-mongo myapp
+  ```
+- **Updating an addon's env** (root credentials, URI): same flow as §B.
+  Edit `~/deploy/myapp/<addon>.env`, restart the addon and the app so
+  both pick up the new value. Note that rotating an addon's root
+  password via env-file change only seeds on first run — to actually
+  rotate, connect as root and run the in-DB password-change command.
+- **Removing an addon**: stop and remove its Quadlet, then strip the
+  matching `NetworkAlias=` line from `myapp-db-pod.pod`, restart the
+  db-pod, and clean up the `<addon>.env` reference in `.env`. The
+  NetApp volume can be kept (for a future re-enable) or
+  decommissioned via ONTAP.
+
+Don't forget the addon when sizing backups — each addon adds a NetApp
+volume that needs its own ONTAP snapshot policy and `pg_dump`-style
+periodic dump if relevant (e.g. `mongodump` for the mongo addon).
+
 ---
 
 ## Rollback

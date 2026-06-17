@@ -7,10 +7,79 @@ Reusable deploy bundle for a Next.js + Prisma + Postgres app that:
   infrastructure as the npm and doc-app stacks, but uses the bun
   runtime end-to-end (build *and* runtime inside the container).
 
-`myapp` is a placeholder slug. Rename everything (folder, Quadlets, env
-files, image tags, NetApp volumes, Caddy upstream) to a real app slug
-before deploying. See the rename checklist at the bottom of
-[`SETUP_CHECKLIST.md`](SETUP_CHECKLIST.md).
+## REQUIRED — rename `myapp` before deploying
+
+**Do not deploy with the literal slug `myapp`.** Every Podman object,
+NetApp volume, env file, hostname stub, and systemd unit name in this
+bundle uses `myapp` as a placeholder. Shipping it as-is will:
+
+- collide with any other app on the server that did the same;
+- name your NetApp volume `vol_myapp_postgres` (literally), making
+  storage audits useless and inviting accidental cross-app restore;
+- generate systemd unit names like `myapp.service` that tell an
+  operator nothing about what's running;
+- produce a Caddy vhost matching `myapp.local` / `myapp.example.com`
+  that doesn't match your real DNS.
+
+This is non-negotiable. Treat it like a `CHANGE_ME` in an env file.
+
+### Three forms — keep them straight
+
+Every occurrence of the slug uses one of three forms, and each form is
+required by the layer that consumes it. The rename script below handles
+all three; this table is so you understand what it's doing.
+
+| Form | Where it appears | Why |
+|---|---|---|
+| `myapp-<thing>` (hyphen) | Podman networks, pods, containers, image tags (`localhost/myapp:1.0`), Caddy upstream (`reverse_proxy myapp:3000`), Quadlet filenames | Podman / DNS conventions prefer hyphens in resolvable names |
+| `myapp_<thing>` (underscore) | NetApp FlexVol names (`vol_myapp_postgres`), junctions (`/myapp_postgres`), host fstab mount points (`/netapp/myapp_data/postgres`), Postgres role / DB names | NetApp + Postgres conventions; NFS junctions are case-sensitive |
+| bare `myapp` | Hostname stub (`myapp.local`), Caddy upstream container name, Mongo DB name | Same slug, no suffix |
+
+Pick a slug that works as **all three forms** — lowercase, no spaces, no
+dots, no leading digit. Hyphens are fine; the script auto-translates to
+underscores for the NetApp/Postgres forms. Keep it under ~30 characters
+so combined names like `<slug>-data-net-network.service` stay readable.
+
+### Concrete rename — copy/paste, then VERIFY zero `myapp` remain
+
+```bash
+# 1. Decide your slug (hyphenated, lowercase, no dots/spaces).
+#    Examples: dor, billing, daily-overview-report.
+APP_SLUG=replace-me
+APP_SLUG_UNDER=$(echo "$APP_SLUG" | tr '-' '_')
+
+# 2. cd to the bundle root (this folder, the one with Containerfile in it).
+cd <bundle root — e.g. ~/projects/<your-repo>/bun>
+
+# 3. Rename FILES whose names contain `myapp`.
+find . -depth -name 'myapp*' -print | while read f; do
+  mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^myapp/$APP_SLUG/")"
+done
+
+# 4. Replace CONTENT — underscored form FIRST, then hyphenated, then bare.
+#    Order matters: the hyphenated replace would otherwise leave
+#    `myapp_postgres` untouched because it has no trailing hyphen,
+#    and the bare replace would clobber things the others should claim.
+find . -type f \( -name 'Containerfile' -o -name '*.md' -o -name '*.network' \
+                  -o -name '*.pod' -o -name '*.container' -o -name '*.example' \
+                  -o -name '*.txt' \) -print0 \
+| xargs -0 sed -i "s/myapp_/${APP_SLUG_UNDER}_/g; \
+                   s/myapp-/${APP_SLUG}-/g; \
+                   s/\\bmyapp\\b/${APP_SLUG}/g"
+
+# 5. VERIFY — this must print "OK". Any hit must be fixed by hand.
+grep -rn 'myapp' . && echo "RENAME INCOMPLETE — fix above hits" || echo OK
+```
+
+**Step 5 is the one that matters.** Anything `grep` finds after step 4
+will either fail at runtime or — worse — attach the wrong NetApp volume
+to the wrong pod and write live app data to someone else's storage.
+Do not skip the verify.
+
+A reference table mapping every identifier to its renamed form lives at
+the bottom of [`SETUP_CHECKLIST.md`](SETUP_CHECKLIST.md). If you use any
+add-ons (see "Add-ons" below), re-run the same rename inside each addon
+folder you keep — addon files use the same `myapp` placeholder.
 
 ## What's in this folder
 
@@ -28,6 +97,44 @@ before deploying. See the rename checklist at the bottom of
 | `REDEPLOY.md` | Day-to-day "ship a new build" runbook. |
 | `SETUP_CHECKLIST.md` | First-time end-to-end checklist. |
 | `README.md` | This file — full setup walkthrough with reasoning. |
+| `mongo-addon/` | **Optional add-on** — MongoDB 7 container alongside Postgres (GridFS file storage, document collections). See `mongo-addon/README.md`. |
+
+## Add-ons (optional)
+
+The base bundle ships **Postgres-only**. Capabilities the project doesn't
+need by default (a second database, an object store, a cache) live in
+opt-in `*-addon/` subfolders. Each addon has its own README with the
+NetApp / Quadlet / env steps to bolt it on.
+
+Currently available:
+
+| Folder | Adds | Typical reason to enable |
+|---|---|---|
+| `mongo-addon/` | MongoDB 7 container in the same DB pod | GridFS file storage, or document collections that don't fit Postgres `jsonb` |
+
+How addons are structured — worth knowing so you can judge whether the
+pattern fits a future need:
+
+- Each addon lives in its own subfolder (`mongo-addon/`, future
+  `redis-addon/`, etc.). The base bundle stays clean — if you don't
+  need an addon, delete its folder and the base setup is unchanged.
+- An addon may slot into the existing `myapp-db-pod` (Mongo does), or
+  introduce its own pod / network if it needs different isolation.
+- Every addon typically requires the same shape of integration: a
+  dedicated NetApp volume, a fstab line, a pre-chown for the
+  rootless-mapped UID, a Quadlet drop, a **one-line edit** to the base
+  `myapp-db-pod.pod` (adding a `NetworkAlias=` for the new service),
+  a new env file, and a new env var in the app `.env`.
+- Addons reuse the same `myapp` placeholder convention — re-run the
+  rename script from the section above inside each addon folder you
+  keep before deploying.
+- An addon's README is authoritative for that addon's quirks
+  (auth-source rules, healthcheck specifics, snapshot timing). The
+  base bundle's troubleshooting catalog covers everything else.
+
+Don't add an addon "in case we need it later." Each one is a NetApp
+volume + a running container + a backup target + a security surface.
+Add only what the app actually uses.
 
 ## When to use this bundle vs. the npm bundle
 

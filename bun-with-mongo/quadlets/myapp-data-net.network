@@ -1,0 +1,27 @@
+# Podman Quadlet — internal data network for the myapp stack.
+#
+# Location on the server (rootless):
+#   ~/.config/containers/systemd/myapp-data-net.network
+#
+# Generated systemd unit:
+#   myapp-data-net-network.service
+#
+# Internal=true blocks outbound internet from anything attached to this
+# network. The database pod sits ONLY on myapp-data-net; the app pod is
+# dual-homed on myapp-data-net + edge-net so Caddy can reach it but the
+# DB cannot phone home and Caddy cannot resolve it.
+#
+# `edge-net` is the shared external-facing network created once per
+# server by the Caddy stack — it is NOT defined here. If this is the
+# first app on the server, deploy Caddy first.
+
+[Unit]
+Description=myapp data network (internal, no internet egress)
+
+[Network]
+NetworkName=myapp-data-net
+Driver=bridge
+Internal=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,74 @@
+# Podman Quadlet — MongoDB 7 container (OPTIONAL ADD-ON).
+#
+# Drop this file into ~/.config/containers/systemd/ ONLY if the app
+# needs MongoDB alongside Postgres (typical reason: GridFS file
+# storage, or schemaless document collections).
+#
+# Generated systemd unit:
+#   myapp-mongo.service
+#
+# Lives in the SAME myapp-db-pod as Postgres (myapp-data-net network only).
+# The app reaches it as `myapp-mongo:27017` via container DNS. GridFS file
+# storage lives at /data/db inside the container.
+#
+# Data is bind-mounted from a SECOND, dedicated NetApp FlexVol
+# `vol_myapp_mongo` (junction `/myapp_mongo`), mounted on the host at
+# /netapp/myapp_data/mongo via fstab — see mongo-addon/README.md for
+# the provisioning + mount + chown steps. NO `:Z` flag — the NFS mount
+# already carries the nfs_t SELinux label and Podman's relabel would
+# conflict.
+#
+# Prerequisite Quadlet edit: the existing myapp-db-pod.pod must carry
+# `NetworkAlias=myapp-mongo` in addition to the existing
+# `NetworkAlias=myapp-postgres`. aardvark-dns registers pods, not the
+# containers inside them, so without the alias the connection string
+# `mongodb://...@myapp-mongo:27017/...` won't resolve. See the addon
+# README for the one-line edit.
+
+[Unit]
+Description=myapp MongoDB 7
+Requires=myapp-db-pod-pod.service
+After=myapp-db-pod-pod.service
+
+[Container]
+Image=docker.io/mongo:7.0
+ContainerName=myapp-mongo
+Pod=myapp-db-pod.pod
+
+# Run as the mongodb user (UID 999) directly. Same NFS rationale as
+# Postgres — see comment in myapp-postgres.container. The bind-mounted
+# data dir on NetApp must be pre-chowned to the host UID that maps to
+# container 999 (<subuid_base> + 998); see addon README.
+User=999:999
+
+# Root credentials seed on FIRST RUN ONLY (when /data/db is empty).
+# Changing values after that does NOT rotate the existing user.
+EnvironmentFile=%h/deploy/myapp/mongo.env
+
+# Persistent GridFS storage on NetApp NFS. LOSING THIS = total file loss
+# (ONTAP snapshots provide point-in-time recovery).
+Volume=/netapp/myapp_data/mongo:/data/db
+
+# Health check — mongosh ships with the image. With auth enabled (we set
+# MONGO_INITDB_ROOT_USERNAME/PASSWORD in mongo.env), unauthenticated
+# mongosh can't perform a full handshake on this version, so the
+# healthcheck has to authenticate. Variables come from the container's
+# env (loaded via EnvironmentFile=). Avoid shell pipes / parens /
+# quotes — Quadlet's HealthCmd= directive passes the value through
+# /bin/sh -c (Dash on Debian) and the parser eats those characters.
+HealthCmd=mongosh --quiet --host localhost --username $MONGO_INITDB_ROOT_USERNAME --password $MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 1
+HealthInterval=10s
+HealthRetries=5
+HealthStartPeriod=30s
+HealthTimeout=5s
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+
+# Resource cap — applied via systemd cgroup. Bump if workload grows.
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

@@ -98,7 +98,31 @@ public package repos at build time. See README §4.
 
 ---
 
-## Phase I — TLS handoff (when DNS for the real hostname is live)
+## Phase I — Add-ons (only if the app needs them)
+
+The base bundle is Postgres-only. If the app needs additional services
+(MongoDB for GridFS, future Redis/MinIO/etc.), each lives in an
+`*-addon/` subfolder of the bundle with its own README that bolts onto
+the setup above. Skip this phase entirely if Postgres covers everything.
+
+- [ ] Decide: does this app actually need an addon? Signals:
+      schemaless documents or GridFS file storage → `mongo-addon/`;
+      blob/object storage in a DB → `mongo-addon/`. Don't enable one
+      "in case" — each addon is a NetApp volume, a running container,
+      and a backup target.
+- [ ] If yes, follow the addon's README. The shape is consistent: a
+      dedicated NetApp volume, fstab line, pre-chown, drop the addon
+      Quadlet into `~/.config/containers/systemd/`, add a
+      `NetworkAlias=` line to `myapp-db-pod.pod`, create the addon env
+      file under `~/deploy/myapp/`, add the URI/credentials to `.env`,
+      `daemon-reload`, restart the affected pods + app.
+- [ ] Re-run the rename script from the base `README.md` inside each
+      addon folder you keep — the addon files use the same `myapp`
+      placeholders.
+
+---
+
+## Phase J — TLS handoff (when DNS for the real hostname is live)
 
 - [ ] **DNS team** — `myapp.example.com` resolves to `<server-ip>`.
 - [ ] **Server** — swap Caddyfile from the phase-1 placeholder block to the phase-2 hostname block (see `caddy-vhost-snippet.txt`).

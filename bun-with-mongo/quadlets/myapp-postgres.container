@@ -1,0 +1,67 @@
+# Podman Quadlet — Postgres 16 container.
+#
+# Location on the server (rootless):
+#   ~/.config/containers/systemd/myapp-postgres.container
+#
+# Generated systemd unit:
+#   myapp-postgres.service
+#
+# Lives in the myapp-db-pod (myapp-data-net network only). The app
+# reaches it as `myapp-postgres:5432` via container DNS.
+#
+# Data is bind-mounted from the dedicated NetApp FlexVol
+# `vol_myapp_postgres` (junction `/myapp_postgres`), which is mounted
+# on the host at /netapp/myapp_data/postgres via fstab — see README §2.
+# NO `:Z` flag — the NFS mount already carries the nfs_t SELinux label
+# and Podman's relabel would conflict.
+
+[Unit]
+Description=myapp Postgres 16
+Requires=myapp-db-pod-pod.service
+After=myapp-db-pod-pod.service
+
+[Container]
+Image=docker.io/postgres:16
+ContainerName=myapp-postgres
+Pod=myapp-db-pod.pod
+
+# Run as the postgres user (UID 999) directly. Without this, the
+# container starts as root, the entrypoint tries to chown/chmod the data
+# dir, and fails on NFS — only the data-dir owner (the rootless-mapped
+# UID, e.g. host 525286 for subuid_base 524288 + 998) can chmod its own
+# dir. Running as 999 from the start bypasses the entrypoint's root
+# branch entirely. The bind-mounted data dir on NetApp must be pre-chowned
+# to the host UID that maps to container 999 — see README §2.4.
+User=999:999
+
+# POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB live in this file
+# (chmod 600 on the host). These seed the database on FIRST RUN ONLY —
+# changing them later does NOT rotate credentials in the existing data dir.
+EnvironmentFile=%h/deploy/myapp/postgres.env
+
+# Persistent data on NetApp NFS. LOSING THIS = total data loss (but
+# ONTAP snapshots provide point-in-time recovery).
+Volume=/netapp/myapp_data/postgres:/var/lib/postgresql/data
+
+# Health check — pg_isready ships with the image. Bare form (no -U/-d
+# args) works because the postgres container has POSTGRES_USER/DB set in
+# its env, and pg_isready defaults to $PGUSER. Quadlet's HealthCmd=
+# directive does NOT handle quoted multi-word values cleanly — systemd's
+# parser drops one of the quote characters and the rest of the run line
+# becomes mis-parsed args. Keep the cmd to a single binary if possible.
+HealthCmd=pg_isready
+HealthInterval=10s
+HealthRetries=5
+HealthStartPeriod=30s
+HealthTimeout=5s
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+
+# Resource cap — applied via systemd cgroup. Bump if workload grows.
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

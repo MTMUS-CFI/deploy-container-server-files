@@ -1,0 +1,53 @@
+# Podman Quadlet — Next.js app pod.
+#
+# Location on the server (rootless):
+#   ~/.config/containers/systemd/myapp-pod.pod
+#
+# Generated systemd unit:
+#   myapp-pod-pod.service
+#
+# Dual-homed:
+#   edge-net        — Caddy reverse-proxies to the app over container DNS
+#   myapp-data-net  — app reaches Postgres over container DNS
+#
+# No host port publishing. Caddy is the only thing exposing :80/:443 on
+# the host; everything else stays inside Podman networks.
+
+[Unit]
+Description=myapp pod
+Requires=edge-net-network.service myapp-data-net-network.service
+After=edge-net-network.service myapp-data-net-network.service
+
+[Pod]
+PodName=myapp-pod
+Network=edge-net
+Network=myapp-data-net
+
+# Keep the pod (its infra container) running even when myapp restarts.
+# Default is `stop`, which kills the pod the moment the last container
+# exits — making `systemctl --user restart myapp` orphan the pod and
+# break dependents on the next start. `continue` lets the container
+# restart attach to the still-running pod cleanly.
+#
+# `PodmanArgs=--exit-policy=continue` rather than `ExitPolicy=continue`
+# because some Quadlet versions don't recognize the dedicated directive
+# in [Pod]. PodmanArgs= forwards the literal flag to `podman pod create`
+# and works on every version.
+PodmanArgs=--exit-policy=continue
+
+# Aardvark-dns registers pods, not the containers inside them. Caddy's
+# `reverse_proxy myapp:3000` references the container name, which
+# wouldn't resolve by default — only `myapp-pod` would. This alias
+# makes `myapp` resolve to the pod's IP on both networks.
+NetworkAlias=myapp
+
+[Service]
+# When myapp.service is restarted, Quadlet's auto-generated BindsTo=
+# can drag this pod into a stopped state. Auto-recover so a manual
+# `systemctl --user restart myapp` doesn't require a follow-up
+# `systemctl --user start myapp-pod-pod`.
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

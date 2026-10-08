@@ -59,13 +59,15 @@ are placeholders — fill from the README.
 ## Phase D — Ship the source / deploy directory
 
 - [ ] **WSL** — `scp -r wsl-npm-deploy-files/ user@<server-ip>:~/deploy/myapp/` (or rename to `myapp/` on the server).
-- [ ] **Server** — `ls ~/deploy/myapp/` shows `Containerfile`, `.env.example`, `postgres.env.example`, `quadlets/`, etc.
+- [ ] **Server** — `ls ~/deploy/myapp/` shows `Containerfile`, `app.env.example`, `postgres.env.example`, `quadlets/`, etc.
 
 ## Phase E — Build, ship, and configure
 
 The image must be built off-server because the server can't reach
 public package repos at build time. See README §4.
 
+- [ ] **WSL** — `grep '"start"' package.json` shows no `-p`/`--port` flag (the app must listen on 3000; otherwise change the port everywhere listed in README "Ports").
+- [ ] **WSL** — the project has an `/api/health` route that checks the database, excluded from auth middleware; `curl -i http://localhost:3000/api/health` in dev returns 200 (not a 307). Point `HealthCmd=` in `quadlets/myapp.container` at it. README "App health route".
 - [ ] **WSL** — `cd ~/projects/myapp && podman build -t localhost/myapp:1.0 -t localhost/myapp:latest .` (5–10 min on first build).
 - [ ] **WSL** — `podman save -o ~/myapp-image.tar localhost/myapp:1.0` (~500 MB–1 GB).
 - [ ] **WSL** — `scp ~/myapp-image.tar user@<server-ip>:~/`.
@@ -73,7 +75,9 @@ public package repos at build time. See README §4.
 - [ ] **Server** — verify with `podman images localhost/myapp` (expect both tags).
 - [ ] **Server** — `rm ~/myapp-image.tar` once loaded.
 - [ ] **Server** — create `~/deploy/myapp/postgres.env` from `postgres.env.example`, chmod 600.
-- [ ] **Server** — create `~/deploy/myapp/.env` from `.env.example`, chmod 600. README §5 covers the connection-string and secret values.
+- [ ] **Server** — pick this app's **site port** (the port users type) and check it's free — README "Ports", step 1. Decide it now; `.env` needs it.
+- [ ] **WSL or Server** — `./set-port.sh <n>` in the bundle folder. Fills the port into this checklist, the READMEs, the Caddy snippet and `app.env.example` (on the server it also re-checks the port is free).
+- [ ] **Server** — create `~/deploy/myapp/.env` from `app.env.example`, chmod 600. Check `NEXTAUTH_URL=http://<server-ip>:<site-port>` has the site port (already there if you ran `./set-port.sh` before copying) — without the port, users are redirected to port 80 after sign-in. README §5 covers the connection-string and secret values.
 
 ## Phase F — Place Quadlets and start
 
@@ -86,14 +90,18 @@ public package repos at build time. See README §4.
 
 - [ ] **Server** — `podman exec myapp npx prisma migrate deploy` (idempotent).
 - [ ] **Server** — `podman exec myapp npx prisma db seed` (one-shot; skip if DB already seeded, or if the project has no seed script).
-- [ ] **Server** — edit `~/deploy/caddy/Caddyfile`: add the block from `caddy-vhost-snippet.txt`.
+- [ ] **Server** — add `PublishPort=<site-port>:<site-port>` to Caddy's Quadlet, `systemctl --user daemon-reload && systemctl --user restart caddy`.
+- [ ] **Server** (sudo) — `firewall-cmd --permanent --add-port=<site-port>/tcp && firewall-cmd --reload`.
+- [ ] **Server** — edit `~/deploy/caddy/Caddyfile`: add the `:<site-port> { ... }` block from `caddy-vhost-snippet.txt`.
 - [ ] **Server** — `podman exec caddy caddy validate ... && podman exec caddy caddy reload ...`.
 
 ## Phase H — Verify
 
 - [ ] **Server** — `podman ps --format 'table {{.Names}}\t{{.Status}}\t{{.Pod}}'` shows caddy + 2 myapp containers, all `(healthy)`.
+- [ ] **Server** — `podman logs myapp 2>&1 | grep -i 'localhost:'` shows `:3000` (the port Caddy and the healthcheck use).
+- [ ] **Server** — `podman exec myapp printenv NEXTAUTH_URL` ends in `:<site-port>`, the same site port as the Caddyfile's `:<site-port> {` block and Caddy's `PublishPort=`.
 - [ ] **Server** — `sudo ls -la /netapp/myapp_data/postgres` shows files written by mapped UIDs.
-- [ ] **WSL** — `curl -I http://<server-ip>/` returns 200, `Content-Type: text/html`.
+- [ ] **WSL** — `curl -I http://<server-ip>:<site-port>/` returns 200 (or a redirect to the login page), `Content-Type: text/html`.
 - [ ] **Windows browser** — load the app and sign in / exercise the smoke path.
 
 ---
@@ -116,9 +124,10 @@ the setup above. Skip this phase entirely if Postgres covers everything.
       `NetworkAlias=` line to `myapp-db-pod.pod`, create the addon env
       file under `~/deploy/myapp/`, add the URI/credentials to `.env`,
       `daemon-reload`, restart the affected pods + app.
-- [ ] Re-run the rename script from the base `README.md` inside each
-      addon folder you keep — the addon files use the same `myapp`
-      placeholders.
+- [ ] If you copied in an addon folder *after* running `rename.sh`,
+      run `./rename.sh <same slug>` again from the bundle root. Only the
+      new addon still has `myapp` placeholders, so only it changes. Use
+      the **same** slug, or its storage paths won't match the base's.
 
 ---
 
@@ -129,6 +138,7 @@ the setup above. Skip this phase entirely if Postgres covers everything.
 - [ ] **Server** — set `NEXTAUTH_URL=https://myapp.example.com` in `~/deploy/myapp/.env`.
 - [ ] **Server** — `caddy validate && caddy reload`, then `systemctl --user restart myapp.service`.
 - [ ] **Browser** — load `https://myapp.example.com/`, verify cert + login.
+- [ ] **Server** — release the site port: remove its `PublishPort=` from Caddy's Quadlet (reload + restart caddy) and `firewall-cmd --permanent --remove-port=<site-port>/tcp && firewall-cmd --reload`.
 
 ---
 

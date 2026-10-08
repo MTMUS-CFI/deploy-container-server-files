@@ -18,7 +18,7 @@ bundle uses `myapp` as a placeholder. Shipping it as-is will:
   storage audits useless and inviting accidental cross-app restore;
 - generate systemd unit names like `myapp.service` that tell an
   operator nothing about what's running;
-- produce a Caddy vhost matching `myapp.local` / `myapp.example.com`
+- produce a Caddy hostname block for `myapp.example.com`
   that doesn't match your real DNS.
 
 This is non-negotiable. Treat it like a `CHANGE_ME` in an env file.
@@ -26,67 +26,56 @@ This is non-negotiable. Treat it like a `CHANGE_ME` in an env file.
 ### Three forms — keep them straight
 
 Every occurrence of the slug uses one of three forms, and each form is
-required by the layer that consumes it. The rename script below handles
+required by the layer that consumes it. `rename.sh` (below) handles
 all three; this table is so you understand what it's doing.
 
 | Form | Where it appears | Why |
 |---|---|---|
 | `myapp-<thing>` (hyphen) | Podman networks, pods, containers, image tags (`localhost/myapp:1.0`), Caddy upstream (`reverse_proxy myapp:3000`), Quadlet filenames | Podman / DNS conventions prefer hyphens in resolvable names |
 | `myapp_<thing>` (underscore) | NetApp FlexVol names (`vol_myapp_postgres`), junctions (`/myapp_postgres`), host fstab mount points (`/netapp/myapp_data/postgres`), Postgres role / DB names | NetApp + Postgres conventions; NFS junctions are case-sensitive |
-| bare `myapp` | Hostname stub (`myapp.local`), Caddy upstream container name, Mongo DB name | Same slug, no suffix |
+| bare `myapp` | Hostname (`myapp.example.com`), Caddy upstream container name, Mongo DB name | Same slug, no suffix |
 
 Pick a slug that works as **all three forms** — lowercase, no spaces, no
-dots, no leading digit. Hyphens are fine; the script auto-translates to
+dots, no leading digit. Hyphens are fine; `rename.sh` auto-translates to
 underscores for the NetApp/Postgres forms. Keep it under ~30 characters
 so combined names like `<slug>-data-net-network.service` stay readable.
 
-### Concrete rename — copy/paste, then VERIFY zero `myapp` remain
+### Rename — run `rename.sh`, then use the storage names it prints
 
 ```bash
-# 1. Decide your slug (hyphenated, lowercase, no dots/spaces).
-#    Examples: dor, billing, daily-overview-report.
-APP_SLUG=replace-me
-APP_SLUG_UNDER=$(echo "$APP_SLUG" | tr '-' '_')
-
-# 2. cd to the bundle root (this folder, the one with Containerfile in it).
-cd <bundle root — e.g. ~/projects/<your-repo>/bun>
-
-# 3. Rename FILES whose names contain `myapp`.
-find . -depth -name 'myapp*' -print | while read f; do
-  mv "$f" "$(dirname "$f")/$(basename "$f" | sed "s/^myapp/$APP_SLUG/")"
-done
-
-# 4. Replace CONTENT — underscored form FIRST, then hyphenated, then bare.
-#    Order matters: the hyphenated replace would otherwise leave
-#    `myapp_postgres` untouched because it has no trailing hyphen,
-#    and the bare replace would clobber things the others should claim.
-find . -type f \( -name 'Containerfile' -o -name '*.md' -o -name '*.network' \
-                  -o -name '*.pod' -o -name '*.container' -o -name '*.example' \
-                  -o -name '*.txt' \) -print0 \
-| xargs -0 sed -i "s/myapp_/${APP_SLUG_UNDER}_/g; \
-                   s/myapp-/${APP_SLUG}-/g; \
-                   s/\\bmyapp\\b/${APP_SLUG}/g"
-
-# 5. VERIFY — this must print "OK". Any hit must be fixed by hand.
-grep -rn 'myapp' . && echo "RENAME INCOMPLETE — fix above hits" || echo OK
+# Slug: lowercase, hyphenated, no dots/spaces. Examples: dor, billing, daily-overview-report.
+./rename.sh <slug>
 ```
 
-**Step 5 is the one that matters.** Anything `grep` finds after step 4
-will either fail at runtime or — worse — attach the wrong NetApp volume
-to the wrong pod and write live app data to someone else's storage.
-Do not skip the verify.
+The script renames files and content (all three forms), refuses an
+invalid slug, and must finish with `OK`. It covers every subfolder,
+including any `*-addon/` folders, so there is nothing to re-run per
+addon. Run it on the copy you're deploying; it won't run a second time
+on an already-renamed copy.
+
+It ends by printing the NetApp volume, junction, and host mount path for
+each database, read from the Quadlets' `Volume=` lines — the paths the
+containers will actually mount. **Create the NetApp volumes, fstab
+lines, and chowns with exactly those names.** If the host mount doesn't
+match the Quadlet's `Volume=` path, the database containers fail to
+start; if it matches a different app's path, they write live data to
+someone else's storage.
+
+The script lives in its own file rather than in this README because the
+rename rewrites every `.md` file — a copy of the script here would
+rewrite its own patterns.
 
 A reference table mapping every identifier to its renamed form lives at
-the bottom of [`SETUP_CHECKLIST.md`](SETUP_CHECKLIST.md). If you use any
-add-ons (see "Add-ons" below), re-run the same rename inside each addon
-folder you keep — addon files use the same `myapp` placeholder.
+the bottom of [`SETUP_CHECKLIST.md`](SETUP_CHECKLIST.md). `rename.sh` also
+renames any add-on folders (see "Add-ons" below), so rename *after*
+deciding which add-ons to keep — or keep them all and delete later.
 
 ## What's in this folder
 
 | File | Purpose |
 |---|---|
 | `Containerfile` | Multi-stage image build — `oven/bun:1-debian` base, `bun install`, Prisma generate, `bun run build`, `CMD bun start`. |
-| `.env.example` | App-level secrets template — DATABASE_URL, Auth.js v5 vars. |
+| `app.env.example` | App-level secrets template — DATABASE_URL, Auth.js v5 vars. |
 | `postgres.env.example` | Postgres seed credentials. |
 | `quadlets/myapp-data-net.network` | Internal, no-egress network for the DB. |
 | `quadlets/myapp-pod.pod` | App pod, dual-homed on edge-net + data-net. |
@@ -97,6 +86,8 @@ folder you keep — addon files use the same `myapp` placeholder.
 | `REDEPLOY.md` | Day-to-day "ship a new build" runbook. |
 | `SETUP_CHECKLIST.md` | First-time end-to-end checklist. |
 | `README.md` | This file — full setup walkthrough with reasoning. |
+| `rename.sh` | Replaces the `myapp` placeholder with your slug and prints the storage names to use. Run first. |
+| `set-port.sh` | Fills in the site port (what users type) everywhere — docs, Caddy snippet, `app.env.example`. See "Ports". |
 | `mongo-addon/` | **Optional add-on** — MongoDB 7 container alongside Postgres (GridFS file storage, document collections). See `mongo-addon/README.md`. |
 
 ## Add-ons (optional)
@@ -125,9 +116,8 @@ pattern fits a future need:
   rootless-mapped UID, a Quadlet drop, a **one-line edit** to the base
   `myapp-db-pod.pod` (adding a `NetworkAlias=` for the new service),
   a new env file, and a new env var in the app `.env`.
-- Addons reuse the same `myapp` placeholder convention — re-run the
-  rename script from the section above inside each addon folder you
-  keep before deploying.
+- Addons reuse the same `myapp` placeholder convention. `rename.sh`
+  renames them along with the base bundle — no separate step.
 - An addon's README is authoritative for that addon's quirks
   (auth-source rules, healthcheck specifics, snapshot timing). The
   base bundle's troubleshooting catalog covers everything else.
@@ -186,6 +176,153 @@ edge-net (shared, host-bridged) ◀── Caddy (separate pod)
 the operator's `loginctl enable-linger` is on, and the
 unprivileged-port floor is lowered. If this is the first app on a
 fresh server, do that setup first.
+
+## App health route
+
+The app container's healthcheck (`HealthCmd=` in `quadlets/myapp.container`)
+requests `/` by default. That's only a placeholder: `curl -f` treats any
+redirect as success, so an app whose middleware redirects `/` to `/login`
+reports healthy even with the database down. **A redirect proves
+nothing.** Give each project a real health route and point the
+healthcheck at it.
+
+```ts
+// app/api/health/route.ts — App Router. Adjust the Prisma import to the project.
+import { prisma } from "@/lib/prisma";
+
+export const dynamic = "force-dynamic"; // never cache a health check
+
+export async function GET() {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return Response.json({ ok: true });
+  } catch {
+    return Response.json({ ok: false }, { status: 503 });
+  }
+}
+```
+
+Then:
+
+1. **Exclude it from auth.** If the project has `middleware.ts`, make sure
+   its `matcher` skips `/api/health`. Otherwise the probe gets the login
+   redirect and passes without ever reaching the route.
+2. **Check it** (WSL, `bun dev` / `npm run dev`):
+   `curl -i http://localhost:3000/api/health` → `200` with `{"ok":true}`,
+   not a 307.
+3. **Point the healthcheck at it** in `quadlets/myapp.container`:
+   `HealthCmd=curl -fsS -o /dev/null http://localhost:3000/api/health`
+
+Keep the route cheap — it runs every 15 seconds. Only check things the
+app can't serve requests without. When the database is down the app
+goes unhealthy and gets restarted (with backoff) until it's back, which
+is the intended behavior.
+
+## Ports
+
+Two ports are involved, and only one of them is yours to pick:
+
+| Port | What it is | Value |
+|---|---|---|
+| **Site port** | What users type to reach the app before it has a domain name: `http://<server-ip>:<site-port>`. It's a port on the server itself, so every app needs a different one. | Pick one per app (e.g. `8081`) |
+| **App port** | Where Next.js listens *inside* its own pod. Only Caddy talks to it. | `3000` — leave it |
+
+Request path: browser → `<server-ip>:<site port>` → Caddy → `myapp:3000`.
+Caddy is the only container that publishes ports on the host. The app
+and DB pods publish nothing, so their ports (3000, 5432) never
+conflict between apps.
+
+### Setting the site port
+
+**1. Pick a port and check it's free** (server). Use a port ≥ 1024 that
+no other app uses:
+
+```bash
+SITE_PORT=8081    # candidate — change it and re-run until all three are empty
+ss -ltn "sport = :$SITE_PORT"                    # only the header line = free
+grep -n ":$SITE_PORT" ~/deploy/caddy/Caddyfile   # no output = no other app's block uses it
+podman ps -a --format '{{.Names}}  {{.Ports}}' | grep ":$SITE_PORT->"   # no output = not published
+```
+
+If any check returns something, the port is taken — pick another.
+
+**2. Fill it in everywhere** — in this bundle folder (WSL or server):
+
+```bash
+./set-port.sh 8081
+```
+
+Every site-port reference in this README, `SETUP_CHECKLIST.md`,
+`REDEPLOY.md`, `caddy-vhost-snippet.txt` and `app.env.example` uses one
+placeholder; the script swaps in your number, so the commands from here
+on are copy-paste ready and `NEXTAUTH_URL` in `app.env.example` already
+has the port. Run on the server, it also refuses a port that's taken.
+
+**3. Publish it from Caddy** (server). Find Caddy's Quadlet, add a
+`PublishPort=` line next to its existing 80/443 ones, and restart Caddy:
+
+```bash
+grep -l 'PublishPort=80' ~/.config/containers/systemd/*.container   # Caddy's Quadlet
+$EDITOR <that file>          # add:  PublishPort=<site-port>:<site-port>
+systemctl --user daemon-reload
+systemctl --user restart caddy
+```
+
+The restart briefly interrupts every app behind Caddy, so pick a quiet
+moment.
+
+**4. Open the firewall** (server):
+
+```bash
+sudo firewall-cmd --permanent --add-port=<site-port>/tcp
+sudo firewall-cmd --reload
+```
+
+**5. Add the site block to the Caddyfile** — `:<site-port> { ... }` from
+`caddy-vhost-snippet.txt`. See §9.
+
+**6. Check `NEXTAUTH_URL` has the port** (`~/deploy/myapp/.env`, §5):
+`NEXTAUTH_URL=http://<server-ip>:<site-port>`. Auth.js builds sign-in and
+callback redirects from this value. If the port is missing, users land
+on `http://<server-ip>/` (port 80, a different app or nothing) after
+logging in.
+
+Test from WSL: `curl -I http://<server-ip>:<site-port>/` should return 200 (or
+a redirect to the login page).
+
+### App port (3000) — leave it unless the app can't use it
+
+The app port is set in four places, and they must all match:
+
+| Where | Setting |
+|---|---|
+| Project `package.json` → `scripts.start` | Next.js reads `PORT`, but `next start -p <n>` / `--port <n>` overrides it. Remove the flag (preferred) or use the same number below. |
+| `Containerfile`, runtime stage | `ENV PORT=3000` and `EXPOSE 3000` |
+| `quadlets/myapp.container` | `HealthCmd=curl ... http://localhost:3000/` |
+| `caddy-vhost-snippet.txt` → server Caddyfile | `reverse_proxy myapp:3000` |
+
+Before building, check the start script (WSL, project root):
+
+```bash
+grep '"start"' package.json
+# OK:       "start": "next start"
+# Problem:  "start": "next start -p 4000"  → remove -p, or change all four places
+```
+
+After the app starts, confirm the port it actually listens on (server):
+
+```bash
+podman logs myapp 2>&1 | grep -i 'localhost:'
+# Next.js prints e.g.  - Local:  http://localhost:3000
+podman exec myapp curl -sS -o /dev/null -w '%{http_code}\n' http://localhost:3000/
+# Any HTTP code (200, 307, ...) = listening. "Connection refused" / 000 = wrong port.
+```
+
+If those disagree with the table above, the healthcheck fails, the
+container is restarted every couple of minutes, and Caddy returns 502.
+
+Don't add `PublishPort=` to the app's Quadlets to "expose" it — users
+reach the app through Caddy's site port.
 
 ---
 
@@ -398,11 +535,33 @@ scp -r ~/projects/myapp/wsl-bun-deploy-files user@<server-ip>:~/deploy/myapp
 ```
 
 Or ship the whole repo if you want the Containerfile / Prisma schema /
-seed scripts on the server as well:
+seed scripts on the server as well. Don't `scp -r` the repo — it drags
+along `node_modules/`, `.next/`, and `.git/` (often 1 GB+), none of which
+the server needs; the image already contains the built app. Stream a
+filtered tarball over SSH instead:
 
 ```bash
-scp -r ~/projects/myapp user@<server-ip>:~/deploy/myapp
+cd ~/projects/myapp
+ssh user@<server-ip> 'mkdir -p ~/deploy/myapp'
+tar -czf - \
+    --exclude='node_modules' \
+    --exclude='.next' \
+    --exclude='.git' \
+    --exclude='out' \
+    --exclude='coverage' \
+    --exclude='.turbo' \
+    --exclude='.vercel' \
+    --exclude='.env' \
+    --exclude='.env.*' \
+    --exclude='*.tar' \
+    . | ssh user@<server-ip> 'tar -xzf - -C ~/deploy/myapp'
 ```
+
+Each `--exclude` matches at any depth, so nested `node_modules/` folders
+are skipped too. The `.env` / `.env.*` excludes keep local dev secrets
+off the server and stop a re-ship from overwriting the server's own
+`~/deploy/myapp/.env` (created in step 5). `*.tar` skips any image
+tarball sitting in the repo from step 4.
 
 (The image tarball gets shipped separately in step 4.)
 
@@ -504,7 +663,7 @@ chmod 600 postgres.env
 $EDITOR postgres.env
 
 # App config + secrets
-cp .env.example .env
+cp app.env.example .env
 chmod 600 .env
 $EDITOR .env
 ```
@@ -521,7 +680,7 @@ Fill `.env` so `DATABASE_URL` references the Postgres values:
 
 ```
 DATABASE_URL=postgresql://<POSTGRES_USER>:<URL_ENCODED_PASSWORD>@myapp-postgres:5432/<POSTGRES_DB>?schema=public
-NEXTAUTH_URL=http://<server-ip>
+NEXTAUTH_URL=http://<server-ip>:<site-port>
 NEXTAUTH_SECRET=<openssl output>
 AUTH_TRUST_HOST=true
 ```
@@ -542,8 +701,13 @@ Three rules that bite if missed:
    as `UntrustedHost: Host must be trusted` in the app logs and
    "Server error" in the browser. Caddy is the trusted edge here.
 
-Switch `NEXTAUTH_URL` to `https://myapp.example.com` when DNS + TLS
-go live (only env change required at that point).
+`<site-port>` is the site port users type ("Ports" → "Setting the site port").
+If you see the site-port placeholder instead of a number, run
+`./set-port.sh` first. It must match the Caddyfile's `:<site-port> {`
+block; leave it out and
+Auth.js redirects users to port 80 after sign-in. Switch `NEXTAUTH_URL`
+to `https://myapp.example.com` when DNS + TLS go live (only env change
+required at that point).
 
 ---
 
@@ -577,7 +741,8 @@ systemctl --user start myapp-data-net-network.service
 systemctl --user start myapp-db-pod-pod.service
 systemctl --user start myapp-postgres.service
 
-# Watch for "(healthy)" — typically 30s:
+# The start blocks until the healthcheck passes (Notify=healthy) —
+# typically ~30s. Confirm it shows (healthy):
 podman ps --format 'table {{.Names}}\t{{.Status}}'
 
 # App pod + container
@@ -623,11 +788,15 @@ runs its seed via `bun run` against a TS file (e.g.
 
 ## 9. Wire Caddy to the app
 
-Edit `~/deploy/caddy/Caddyfile` and add the block from
-`caddy-vhost-snippet.txt`:
+First set up the site port — pick it, fill it in with `./set-port.sh`,
+publish it from Caddy, open the firewall ("Ports" → "Setting the site
+port", steps 1–4).
+
+Then edit `~/deploy/caddy/Caddyfile` and add the block from
+`caddy-vhost-snippet.txt` (after `./set-port.sh`, it has your port):
 
 ```caddy
-myapp.local {
+:<site-port> {
     encode zstd gzip
 
     reverse_proxy myapp:3000 {
@@ -643,7 +812,9 @@ myapp.local {
         }
     }
 
-    handle /healthz { respond "ok" 200 }
+    handle /healthz {
+        respond "ok" 200
+    }
 }
 ```
 
@@ -657,10 +828,10 @@ podman exec caddy caddy reload   --config /etc/caddy/Caddyfile
 `validate` first — `reload` will refuse a broken config and the
 running Caddy keeps serving the previous one.
 
-To test from WSL with the hostname stub:
+Test from WSL:
 
 ```bash
-curl -H 'Host: myapp.local' -I http://<server-ip>/
+curl -I http://<server-ip>:<site-port>/
 ```
 
 When real DNS goes live, swap to the phase-2 hostname block (see
@@ -677,16 +848,16 @@ podman ps --format 'table {{.Names}}\t{{.Status}}\t{{.Pod}}'
 # NetApp data dir claimed by Postgres?
 sudo ls -la /netapp/myapp_data/postgres
 
-# App responding through Caddy?
-curl -H 'Host: myapp.local' -I http://<server-ip>/
+# App responding through Caddy on the site port?
+curl -I http://<server-ip>:<site-port>/
 
 # Database connectivity:
 podman exec myapp bunx prisma db pull --print | head
 podman exec -it myapp-postgres psql -U "$POSTGRES_USER" -c '\dt'
 ```
 
-Open the app in a browser (with /etc/hosts mapping for `myapp.local`
-or via the real hostname once DNS is live) and run a smoke test.
+Open `http://<server-ip>:<site-port>/` in a browser (or the real
+hostname once DNS is live) and run a smoke test.
 
 ---
 
@@ -694,7 +865,7 @@ or via the real hostname once DNS is live) and run a smoke test.
 
 When DNS for `myapp.example.com` points to `<server-ip>`:
 
-1. Replace the `myapp.local { ... }` block in the Caddyfile with the
+1. Replace the `:<site-port> { ... }` block in the Caddyfile with the
    phase-2 hostname block (see `caddy-vhost-snippet.txt`).
 2. Update `.env`: `NEXTAUTH_URL=https://myapp.example.com`.
 3. Reload:
@@ -706,6 +877,12 @@ When DNS for `myapp.example.com` points to `<server-ip>`:
 Caddy auto-provisions a Let's Encrypt cert via HTTP-01 (port 80 must
 remain reachable from the public internet). For an internal-only
 domain, swap to `tls internal`.
+
+Then release the site port so another app can use it: remove its
+`PublishPort=` line from Caddy's Quadlet (`daemon-reload` + restart
+caddy) and run
+`sudo firewall-cmd --permanent --remove-port=<site-port>/tcp && sudo firewall-cmd --reload`.
+If people have bookmarked the port URL, keep both until they've moved.
 
 ---
 
@@ -785,6 +962,25 @@ domain, swap to `tls internal`.
   add one (`"start": "next start"`) or change `CMD` in the Containerfile
   to call the entrypoint directly: `["bun", "run", "next", "start"]`
   for Next.js apps.
+- **`systemctl --user start` hangs, then fails with a timeout** — the
+  container started but its healthcheck never passed within
+  `TimeoutStartSec=` (`Notify=healthy` holds the start until it does).
+  Check what the healthcheck sees:
+  `podman healthcheck run <container>; echo $?` and
+  `journalctl --user -u <container> -n 50`. For the app, the usual cause
+  is the `HealthCmd=` path returning 4xx/5xx — point it at the
+  `/api/health` route ("App health route"). If the route checks
+  something that can't pass on a fresh start, `Notify=healthy` will
+  never let the unit start — keep it to live dependencies.
+- **Container keeps restarting every minute or two** — it is going
+  unhealthy and `HealthOnFailure=kill` is replacing it. That is the
+  intended recovery, but a loop means the cause is persistent (DB
+  unreachable, bad env, NFS down). `journalctl --user -u <container>`
+  shows why; restarts back off to one every 5 min while it persists.
+- **App never becomes healthy and Caddy returns 502, but the logs look
+  normal** — the app is listening on a different port than 3000,
+  usually because the `start` script passes `-p`/`--port`. See
+  "Ports" → "Setting the app's port".
 - **Caddy returns 502** — usually the app pod is still starting.
   Check with `podman exec caddy wget -qO- http://myapp:3000/`. If
   that fails too, it's a network-attachment issue, not an app issue.

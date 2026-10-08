@@ -63,6 +63,10 @@ RUN npx prisma generate \
 # -----------------------------------------------------------------------------
 FROM docker.io/node:24-bookworm AS runtime
 WORKDIR /app
+# PORT is the port the app listens on INSIDE its pod — no host port is used.
+# If you change it, change EXPOSE below, HealthCmd= in the app Quadlet, and
+# Caddy's reverse_proxy to match, and make sure package.json's start script
+# doesn't pass -p/--port. See README "Ports".
 ENV NODE_ENV=production \
     PORT=3000
 USER root

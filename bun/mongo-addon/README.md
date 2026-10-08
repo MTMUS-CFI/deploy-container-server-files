@@ -157,6 +157,20 @@ chmod 600 ~/deploy/myapp/mongo.env
 $EDITOR ~/deploy/myapp/mongo.env       # set MONGO_INITDB_ROOT_USERNAME / PASSWORD
 ```
 
+Then make the app wait for Mongo the same way it waits for Postgres.
+In `~/.config/containers/systemd/myapp.container`, add
+`myapp-mongo.service` to both dependency lines:
+
+```diff
+-Requires=myapp-pod-pod.service myapp-postgres.service
+-After=myapp-pod-pod.service myapp-postgres.service
++Requires=myapp-pod-pod.service myapp-postgres.service myapp-mongo.service
++After=myapp-pod-pod.service myapp-postgres.service myapp-mongo.service
+```
+
+Without this, after a reboot the app can start before Mongo is
+healthy and fail its first connections.
+
 Generate a strong password:
 
 ```bash

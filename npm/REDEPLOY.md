@@ -91,12 +91,15 @@ rm ~/myapp-image.tar            # optional cleanup
 
 ```bash
 systemctl --user restart myapp
-sleep 10
 podman ps --filter name=myapp --format 'table {{.Names}}\t{{.Status}}'
 ```
 
-Should report `Up X seconds (healthy)` within ~90s. The DB and pods
-keep running — only the app container picks up the new image.
+The restart doesn't return until the new container passes its
+healthcheck (`Notify=healthy` in the Quadlet), usually within ~90s, so
+`podman ps` should already show `(healthy)`. If the restart instead
+fails with a timeout, the new build never became healthy — check
+`journalctl --user -u myapp -n 50` and roll back (see below). The DB
+and pods keep running — only the app container picks up the new image.
 
 If `restart myapp` returns "dependency job failed" because the pod was
 stranded:
@@ -112,11 +115,11 @@ systemctl --user start myapp
 
 ```bash
 # From WSL or your workstation
-curl -I http://<server-ip>/
+curl -I http://<server-ip>:<site-port>/
 # Expect: HTTP/1.1 200 OK, Content-Type: text/html
 ```
 
-Then load `http://<server-ip>/` in a browser and exercise whatever flow
+Then load `http://<server-ip>:<site-port>/` in a browser and exercise whatever flow
 you changed.
 
 ---
@@ -265,6 +268,7 @@ restart postgres.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `systemctl --user --failed` lists units named after a long hex ID (e.g. `3f9c…e1.service` / `.timer`) | Podman runs each healthcheck from a transient systemd timer named after the container ID. Quadlet always runs containers with `--rm`, so every restart or redeploy creates a new container ID, and the old container's healthcheck unit can be left behind as failed | Harmless — the running container has its own, new unit. Clear them with `systemctl --user reset-failed`. Check the real units with `systemctl --user status myapp` |
 | `Error: image localhost/myapp:latest not found` after restart | `podman tag :1.0 :latest` step skipped | Run the tag command from step 3 |
 | `restart myapp` errors with "dependency job failed" | Pod stranded in dead state — pod's exit-policy defaults to `stop`, which kills it when the container restarts | Recover: `reset-failed`, then start `myapp-pod-pod`, then `myapp`. Permanent: ensure `myapp-pod.pod` carries `PodmanArgs=--exit-policy=continue` |
 | `quadlet-generator: unsupported key 'ExitPolicy' in group 'Pod'` | Older Quadlet versions don't accept the dedicated `ExitPolicy=` directive | Use `PodmanArgs=--exit-policy=continue` instead — same effect, recognized everywhere |

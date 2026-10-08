@@ -12,8 +12,8 @@
 
 [Unit]
 Description=myapp Next.js application
-Requires=myapp-pod-pod.service myapp-postgres.service
-After=myapp-pod-pod.service myapp-postgres.service
+Requires=myapp-pod-pod.service myapp-postgres.service myapp-mongo.service
+After=myapp-pod-pod.service myapp-postgres.service myapp-mongo.service
 
 [Container]
 Image=localhost/myapp:latest
@@ -26,25 +26,67 @@ Pod=myapp-pod.pod
 # chmod 600 on the host file.
 EnvironmentFile=%h/deploy/myapp/.env
 
-# No host port publishing — Caddy reaches us via myapp:3000 on edge-net.
+# No host port publishing — Caddy reaches us via myapp:3000 on edge-net,
+# so the app never needs a free port on the host. Don't add PublishPort=.
+# 3000 must match the Containerfile's PORT/EXPOSE, the port in HealthCmd=
+# below, and Caddy's reverse_proxy — see README "Ports".
 
-# Health check — adjust to a real /api/health route once the project
-# has one. For now this assumes a public path that returns 200 OK once
-# Next.js is ready (e.g. /login on apps with an auth screen, or / on
-# fully-public apps). curl -f exits non-zero on HTTP 4xx/5xx, so no need
-# for shell pipes or || exit (which Quadlet's HealthCmd= directive
-# can't safely pass to podman — systemd's parser eats some of the
-# special characters).
-HealthCmd=curl -fsS http://localhost:3000/
+# Health check — point this at the project's /api/health route (README
+# "App health route") as soon as it has one. The `/` default only proves
+# Next.js is answering, and often not even that: curl -f fails on 4xx/5xx
+# but PASSES any 3xx, so on an app whose auth middleware redirects `/` to
+# /login the probe reports healthy with the database down. A redirect
+# proves nothing.
+#
+# No shell pipes or || exit — Quadlet's HealthCmd= can't safely pass them
+# to podman (systemd's parser eats some of the special characters).
+# -o /dev/null keeps the page body out of the stored healthcheck log.
+HealthCmd=curl -fsS -o /dev/null http://localhost:3000/
 HealthInterval=15s
 HealthRetries=5
 HealthStartPeriod=90s
 HealthTimeout=10s
 
+# What to do once the healthcheck has failed HealthRetries times in a
+# row. Podman's default (`none`) only labels the container "unhealthy"
+# and leaves it running, broken. `kill` stops it so the Restart= policy
+# in [Service] brings up a fresh one.
+HealthOnFailure=kill
+
+# Don't mark the unit as started until the first healthcheck passes.
+# Units ordered After= this one then wait for a service that actually
+# answers, not just a container that exists. Requires Podman 5.0+.
+#
+# With Notify=healthy + HealthOnFailure=kill, a probe that can NEVER pass
+# loops forever: start timeout (or kill) → restart → same again, slowed
+# only by RestartSteps= backoff. So:
+#   - TimeoutStartSec= in [Service] must exceed
+#     HealthStartPeriod + HealthRetries × HealthInterval + HealthTimeout,
+#     with room to spare for a slow first start.
+#   - Never use a freshness-style probe here (e.g. "a job ran in the last
+#     hour", "data updated today"). It can't pass on a fresh start, so the
+#     unit never finishes starting. Check those from monitoring instead.
+Notify=healthy
+
 [Service]
 Restart=on-failure
 RestartSec=10s
-TimeoutStartSec=180s
+# Back off on repeated failures (e.g. a NetApp outage): the delay grows
+# from RestartSec= to RestartMaxDelaySec= over RestartSteps= restarts
+# instead of retrying every few seconds forever. Requires systemd 254+
+# (RHEL 10 ships 257).
+#
+# StartLimitBurst= / StartLimitIntervalSec= are deliberately left at
+# systemd's default (5 starts per 10s). RestartSec= is at least 5s and
+# only grows, so automatic restarts can't reach that rate and the limit
+# never strands the unit in "failed". Don't set StartLimitBurst=0 or
+# StartLimitIntervalSec=0 "to be safe"; it isn't needed and removes the
+# guard against a genuinely tight loop.
+RestartSteps=6
+RestartMaxDelaySec=5min
+# Health budget: 90s start period + 5 × 15s retries + 10s timeout ≈ 175s.
+# 300s leaves room for a slow cold start.
+TimeoutStartSec=300s
 
 # Resource cap — applied via systemd cgroup. Bump if the app workload
 # legitimately exceeds this.

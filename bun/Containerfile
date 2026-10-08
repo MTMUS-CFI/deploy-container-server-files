@@ -30,9 +30,14 @@ FROM docker.io/oven/bun:1-debian AS build
 WORKDIR /app
 USER root
 
-# The bun base image is Debian-based and ships a CA bundle, so apt over HTTPS
-# works. Rewrite sources to HTTPS in case the build environment blocks plain
+# Rewrite apt sources to HTTPS in case the build environment blocks plain
 # HTTP:80 (corporate firewall, restricted network).
+#
+# NOTE: unlike node:24-bookworm, oven/bun:1-debian is a slim image with NO CA
+# bundle (no ca-certificates package, empty /etc/ssl/certs). Any apt call over
+# HTTPS fails certificate verification until ca-certificates is installed —
+# see the bootstrap in the runtime stage, and copy it into any apt step you
+# add here.
 RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
      | xargs -r sed -i 's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g'
 
@@ -40,7 +45,8 @@ RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
 # bcryptjs (pure JS) doesn't need this; bcrypt (native) does. sharp ships
 # prebuilt binaries for most platforms but can fall back to compile. bun's
 # install behavior tends to surface fewer prebuilt-binary issues than npm.
-# RUN apt-get update \
+# RUN apt-get -o Acquire::https::Verify-Peer=false update \
+#  && apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends ca-certificates \
 #  && apt-get install -y --no-install-recommends build-essential python3 \
 #  && rm -rf /var/lib/apt/lists/*
 
@@ -73,6 +79,10 @@ RUN bunx prisma generate \
 # -----------------------------------------------------------------------------
 FROM docker.io/oven/bun:1-debian AS runtime
 WORKDIR /app
+# PORT is the port the app listens on INSIDE its pod — no host port is used.
+# If you change it, change EXPOSE below, HealthCmd= in the app Quadlet, and
+# Caddy's reverse_proxy to match, and make sure package.json's start script
+# doesn't pass -p/--port. See README "Ports".
 ENV NODE_ENV=production \
     PORT=3000
 USER root
@@ -80,11 +90,23 @@ USER root
 # curl is the only runtime-only OS dep (used by the container's HEALTHCHECK).
 # ca-certificates for outbound TLS to whatever external services the app
 # talks to. If the app needs anything else at runtime (e.g. fonts for PDF
-# rendering, LibreOffice for office-doc conversion), add it here.
+# rendering, LibreOffice for office-doc conversion), add it to the last
+# install line.
+#
+# CA bootstrap: this image ships no CA bundle, so apt can't verify HTTPS until
+# ca-certificates is installed — and it can't install ca-certificates over
+# HTTPS without one. The first two apt calls skip TLS peer verification to
+# break that loop. This is safe: apt verifies every package against the
+# Debian archive's GPG keys (already in the image) regardless of transport —
+# the same guarantee Debian's default plain-HTTP mirrors rely on. Everything
+# after that runs with normal verification. Without the bootstrap,
+# `apt-get update` only WARNS ("certificate verify failed") and the failure
+# surfaces later as "Package 'ca-certificates' has no installation candidate".
 RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
      | xargs -r sed -i 's|http://deb.debian.org|https://deb.debian.org|g; s|http://security.debian.org|https://security.debian.org|g' \
- && apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
+ && apt-get -o Acquire::https::Verify-Peer=false update \
+ && apt-get -o Acquire::https::Verify-Peer=false install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends curl \
  && rm -rf /var/lib/apt/lists/*
 
 # Copy only what runtime needs. Adjust the list based on the project's

@@ -61,7 +61,7 @@ values are placeholders — fill from the README.
 ## Phase D — Ship the source / deploy directory
 
 - [ ] **WSL** — `scp -r bun-with-mongo/ user@<server-ip>:~/deploy/myapp/` (or rename to `myapp/` on the server).
-- [ ] **Server** — `ls ~/deploy/myapp/` shows `Containerfile`, `.env.example`, `postgres.env.example`, `mongo.env.example`, `quadlets/` (with both `myapp-postgres.container` and `myapp-mongo.container`), etc.
+- [ ] **Server** — `ls ~/deploy/myapp/` shows `Containerfile`, `app.env.example`, `postgres.env.example`, `mongo.env.example`, `quadlets/` (with both `myapp-postgres.container` and `myapp-mongo.container`), etc.
 
 ## Phase E — Build, ship, and configure
 
@@ -70,6 +70,8 @@ public package repos at build time. See README §4.
 
 - [ ] **WSL** — `bun --version` matches the container's base image major (1.x). If it doesn't, install matching bun (or accept the regenerate-lockfile step below).
 - [ ] **WSL** — `cd ~/projects/myapp && bun install` to regenerate `bun.lock` on Linux if it was last touched on Windows. Commit the lockfile if needed.
+- [ ] **WSL** — `grep '"start"' package.json` shows no `-p`/`--port` flag (the app must listen on 3000; otherwise change the port everywhere listed in README "Ports").
+- [ ] **WSL** — the project has an `/api/health` route that checks the database, excluded from auth middleware; `curl -i http://localhost:3000/api/health` in dev returns 200 (not a 307). Point `HealthCmd=` in `quadlets/myapp.container` at it. README "App health route".
 - [ ] **WSL** — `podman build -t localhost/myapp:1.0 -t localhost/myapp:latest .` (1–3 min on first build).
 - [ ] **WSL** — `podman save -o ~/myapp-image.tar localhost/myapp:1.0` (~500 MB–1 GB).
 - [ ] **WSL** — `scp ~/myapp-image.tar user@<server-ip>:~/`.
@@ -78,7 +80,9 @@ public package repos at build time. See README §4.
 - [ ] **Server** — `rm ~/myapp-image.tar` once loaded.
 - [ ] **Server** — create `~/deploy/myapp/postgres.env` from `postgres.env.example`, chmod 600.
 - [ ] **Server** — create `~/deploy/myapp/mongo.env` from `mongo.env.example`, chmod 600.
-- [ ] **Server** — create `~/deploy/myapp/.env` from `.env.example`, chmod 600. Set both `DATABASE_URL` AND `MONGODB_URI` (the Mongo URI MUST end with `?authSource=admin`). README §5 covers the connection-string and secret values.
+- [ ] **Server** — pick this app's **site port** (the port users type) and check it's free — README "Ports", step 1. Decide it now; `.env` needs it.
+- [ ] **WSL or Server** — `./set-port.sh <n>` in the bundle folder. Fills the port into this checklist, the READMEs, the Caddy snippet and `app.env.example` (on the server it also re-checks the port is free).
+- [ ] **Server** — create `~/deploy/myapp/.env` from `app.env.example`, chmod 600. Check `NEXTAUTH_URL=http://<server-ip>:<site-port>` has the site port (already there if you ran `./set-port.sh` before copying) — without the port, users are redirected to port 80 after sign-in. Set both `DATABASE_URL` AND `MONGODB_URI` (the Mongo URI MUST end with `?authSource=admin`). README §5 covers the connection-string and secret values.
 
 ## Phase F — Place Quadlets and start
 
@@ -91,15 +95,19 @@ public package repos at build time. See README §4.
 
 - [ ] **Server** — `podman exec myapp bunx prisma migrate deploy` (idempotent). Mongo has no migration step — collection shapes are managed by the application.
 - [ ] **Server** — `podman exec myapp bunx prisma db seed` (one-shot; skip if DB already seeded, or if the project has no seed script).
-- [ ] **Server** — edit `~/deploy/caddy/Caddyfile`: add the block from `caddy-vhost-snippet.txt`.
+- [ ] **Server** — add `PublishPort=<site-port>:<site-port>` to Caddy's Quadlet, `systemctl --user daemon-reload && systemctl --user restart caddy`.
+- [ ] **Server** (sudo) — `firewall-cmd --permanent --add-port=<site-port>/tcp && firewall-cmd --reload`.
+- [ ] **Server** — edit `~/deploy/caddy/Caddyfile`: add the `:<site-port> { ... }` block from `caddy-vhost-snippet.txt`.
 - [ ] **Server** — `podman exec caddy caddy validate ... && podman exec caddy caddy reload ...`.
 
 ## Phase H — Verify
 
 - [ ] **Server** — `podman ps --format 'table {{.Names}}\t{{.Status}}\t{{.Pod}}'` shows caddy + 3 myapp containers (`myapp`, `myapp-postgres`, `myapp-mongo`), all `(healthy)`.
+- [ ] **Server** — `podman logs myapp 2>&1 | grep -i 'localhost:'` shows `:3000` (the port Caddy and the healthcheck use).
+- [ ] **Server** — `podman exec myapp printenv NEXTAUTH_URL` ends in `:<site-port>`, the same site port as the Caddyfile's `:<site-port> {` block and Caddy's `PublishPort=`.
 - [ ] **Server** — `sudo ls -la /netapp/myapp_data/postgres` AND `sudo ls -la /netapp/myapp_data/mongo` both show files written by mapped UIDs.
 - [ ] **Server** — Mongo auth works: `podman exec myapp-mongo mongosh -u "$MONGO_INITDB_ROOT_USERNAME" --authenticationDatabase admin --eval "db.adminCommand('ping')"` returns `{ ok: 1 }`.
-- [ ] **WSL** — `curl -I http://<server-ip>/` returns 200, `Content-Type: text/html`.
+- [ ] **WSL** — `curl -I http://<server-ip>:<site-port>/` returns 200 (or a redirect to the login page), `Content-Type: text/html`.
 - [ ] **Windows browser** — load the app, sign in (exercises Postgres), and exercise a flow that reads/writes Mongo (file upload, document read).
 
 ---
@@ -111,6 +119,7 @@ public package repos at build time. See README §4.
 - [ ] **Server** — set `NEXTAUTH_URL=https://myapp.example.com` in `~/deploy/myapp/.env`.
 - [ ] **Server** — `caddy validate && caddy reload`, then `systemctl --user restart myapp.service`.
 - [ ] **Browser** — load `https://myapp.example.com/`, verify cert + login.
+- [ ] **Server** — release the site port: remove its `PublishPort=` from Caddy's Quadlet (reload + restart caddy) and `firewall-cmd --permanent --remove-port=<site-port>/tcp && firewall-cmd --reload`.
 
 ## Phase J — Backup policy (sized for two DBs)
 

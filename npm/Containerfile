@@ -39,6 +39,19 @@ RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
 #  && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
+
+# Prisma + a `postinstall` hook: if this project's package.json runs
+# `prisma generate` in a postinstall script (common with Prisma), that hook
+# fires DURING the `npm ci` below and aborts the build with
+#   Error: Could not find Prisma Schema that is required for this command.
+# because prisma/schema.prisma isn't in the image yet at this layer.
+# Uncomment the next line so the schema is present before install.
+#
+# Leave it commented for non-Prisma projects — COPY of a missing prisma/
+# dir would itself error. (Alternative: add --ignore-scripts to npm ci and
+# rely on the explicit `npx prisma generate` below, but that disables EVERY
+# dependency's install scripts, not just Prisma's.)
+# COPY prisma ./prisma
 RUN npm ci
 
 COPY . .

@@ -38,7 +38,18 @@ RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
 #  && apt-get install -y --no-install-recommends build-essential python3 \
 #  && rm -rf /var/lib/apt/lists/*
 
-COPY package.json package-lock.json ./
+# Build-time placeholder envs. Some frameworks (e.g. Next.js's page-data
+# collection) import every route at build time, and any module-level
+# `process.env.X` check throws if X is unset — even though the real value
+# arrives at runtime via the Quadlet's EnvironmentFile.
+#
+# List here only the vars that fail the build if absent. The runtime stage
+# doesn't inherit these, so no secrets leak into the image.
+ENV DATABASE_URL=postgresql://buildtime-placeholder:placeholder@localhost:5432/build?schema=public \
+    NEXTAUTH_SECRET=buildtime-placeholder-not-used-at-runtime \
+    NEXTAUTH_URL=http://localhost:3000
+
+COPY package.json package-lock.json prisma.config.ts ./
 
 # Prisma + a `postinstall` hook: if this project's package.json runs
 # `prisma generate` in a postinstall script (common with Prisma), that hook
@@ -55,17 +66,6 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY . .
-
-# Build-time placeholder envs. Some frameworks (e.g. Next.js's page-data
-# collection) import every route at build time, and any module-level
-# `process.env.X` check throws if X is unset — even though the real value
-# arrives at runtime via the Quadlet's EnvironmentFile.
-#
-# List here only the vars that fail the build if absent. The runtime stage
-# doesn't inherit these, so no secrets leak into the image.
-ENV DATABASE_URL=postgresql://buildtime-placeholder:placeholder@localhost:5432/build?schema=public \
-    NEXTAUTH_SECRET=buildtime-placeholder-not-used-at-runtime \
-    NEXTAUTH_URL=http://localhost:3000
 
 RUN npx prisma generate \
  && npm run build
@@ -99,6 +99,7 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/public ./public
 COPY --from=build /app/prisma ./prisma
+COPY --from=build /app/prisma.config.ts ./prisma.config.ts
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/package-lock.json ./package-lock.json
 COPY --from=build /app/next.config.* ./

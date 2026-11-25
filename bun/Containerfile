@@ -50,11 +50,23 @@ RUN find /etc/apt -name '*.list' -o -name '*.sources' 2>/dev/null \
 #  && apt-get install -y --no-install-recommends build-essential python3 \
 #  && rm -rf /var/lib/apt/lists/*
 
+# Build-time placeholder envs. Some frameworks (e.g. Next.js's page-data
+# collection) import every route at build time, and any module-level
+# `process.env.X` check throws if X is unset — even though the real value
+# arrives at runtime via the Quadlet's EnvironmentFile.
+#
+# List here only the vars that fail the build if absent. The runtime stage
+# doesn't inherit these, so no secrets leak into the image.
+ENV DATABASE_URL=postgresql://buildtime-placeholder:placeholder@localhost:5432/build?schema=public \
+    NEXTAUTH_SECRET=buildtime-placeholder-not-used-at-runtime \
+    NEXTAUTH_URL=http://localhost:3000
+
 # bun supports two lockfile formats — bun.lock (text, default since 1.1.x) and
 # bun.lockb (older binary). The wildcard copies whichever the project actually
 # has. The * suffix makes it harmless if neither exists, but --frozen-lockfile
 # below will then fail loudly (which is what you want).
-COPY package.json bun.lock* bun.lockb* ./
+COPY package.json bun.lock* bun.lockb* prisma.config.ts ./
+COPY prisma ./prisma
 
 # Prisma + a `postinstall` hook: if this project's package.json runs
 # `prisma generate` in a postinstall script (common with Prisma), that hook
@@ -71,17 +83,6 @@ COPY package.json bun.lock* bun.lockb* ./
 RUN bun install --frozen-lockfile
 
 COPY . .
-
-# Build-time placeholder envs. Some frameworks (e.g. Next.js's page-data
-# collection) import every route at build time, and any module-level
-# `process.env.X` check throws if X is unset — even though the real value
-# arrives at runtime via the Quadlet's EnvironmentFile.
-#
-# List here only the vars that fail the build if absent. The runtime stage
-# doesn't inherit these, so no secrets leak into the image.
-ENV DATABASE_URL=postgresql://buildtime-placeholder:placeholder@localhost:5432/build?schema=public \
-    NEXTAUTH_SECRET=buildtime-placeholder-not-used-at-runtime \
-    NEXTAUTH_URL=http://localhost:3000
 
 RUN bunx prisma generate \
  && bun run build
@@ -128,6 +129,7 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/public ./public
 COPY --from=build /app/prisma ./prisma
+COPY --from=build /app/prisma.config.ts ./prisma.config.ts
 COPY --from=build /app/package.json ./package.json
 # bun lockfile carries through so post-deploy debugging can re-run bun commands
 # with the same resolution. If your project uses bun.lockb (binary), the
